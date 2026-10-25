@@ -1,6 +1,7 @@
 import html
 import json
 import re
+import time
 
 from http_utils.http_client import HttpClient
 from utils.enums import StatusCode, TikTokError
@@ -170,53 +171,70 @@ class TikTokAPI:
         return room_id
 
     def _tikrec_get_room_id_signed_url(self, user: str) -> str:
-        try:
-            response = self.http_client.get(
-                f"{self.TIKREC_API}/tiktok/room/api/sign",
-                params={"unique_id": user},
-            )
-            response.raise_for_status()
-        except Exception as e:
-            raise TikRecUnavailableError(
-                f"tikrec signing service is unreachable: {e}"
-            ) from e
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                response = self.http_client.get(
+                    f"{self.TIKREC_API}/tiktok/room/api/sign",
+                    params={"unique_id": user},
+                    cookies={},
+                    timeout=10,
+                )
+                response.raise_for_status()
+                data = response.json()
+                signed_path = data.get("signed_path")
+                if signed_path:
+                    return f"{self.BASE_URL}{signed_path}"
+                elif data.get("signed_url"):
+                    return data.get("signed_url")
+                raise TikRecUnavailableError(
+                    "tikrec signing service did not return a signed_path"
+                )
+            except Exception as e:
+                last_error = e
+                if attempt < 3:
+                    time.sleep(1.5)
 
-        try:
-            data = response.json()
-        except ValueError as e:
-            raise TikRecUnavailableError(
-                "tikrec signing service returned an invalid response "
-                "(expected JSON, got something else — the service may be down)."
-            ) from e
-
-        signed_path = data.get("signed_path")
-        if not signed_path:
-            raise TikRecUnavailableError(
-                "tikrec signing service did not return a signed_path "
-                "(the service may be down or overloaded)."
-            )
-
-        return f"{self.BASE_URL}{signed_path}"
+        raise TikRecUnavailableError(
+            f"tikrec signing service is unreachable: {last_error}"
+        ) from last_error
 
     def get_room_id_from_user(self, user: str) -> str | None:
         """Given a username, get the room_id."""
-        try:
-            signed_url = self._tikrec_get_room_id_signed_url(user)
-        except TikRecUnavailableError as e:
-            logger.warning(
-                f"[!] tikrec is unavailable ({e}). "
-                "Falling back to unsigned API — recording continues but may be less reliable."
-            )
-            return self._old_get_room_id_from_user(user)
+        for attempt in range(1, 4):
+            try:
+                signed_url = self._tikrec_get_room_id_signed_url(user)
+            except TikRecUnavailableError as e:
+                logger.warning(
+                    f"[!] tikrec is unavailable ({e}). "
+                    "Falling back to unsigned API — recording continues but may be less reliable."
+                )
+                return self._old_get_room_id_from_user(user)
 
-        response = self.http_client.get(signed_url)
-        content = response.text
+            response = self.http_client.get(signed_url)
 
-        if not content or "Please wait" in content:
-            raise UserLiveError(TikTokError.WAF_BLOCKED)
+            if response.status_code == 429:
+                logger.warning(
+                    f"[!] TikTok rate-limited (HTTP 429). Retrying attempt {attempt}/3 in 2.5s..."
+                )
+                time.sleep(2.5)
+                continue
 
-        data = response.json()
-        return (data.get("data") or {}).get("user", {}).get("roomId")
+            content = response.text
+
+            if not content or "Please wait" in content:
+                raise UserLiveError(TikTokError.WAF_BLOCKED)
+
+            try:
+                data = response.json()
+                return (data.get("data") or {}).get("user", {}).get("roomId")
+            except Exception:
+                if attempt < 3:
+                    time.sleep(2)
+                    continue
+                raise UserLiveError(TikTokError.ROOM_ID_ERROR)
+
+
 
     def get_followers_list(self, sec_uid) -> list:
         """

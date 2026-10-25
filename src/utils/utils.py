@@ -18,7 +18,28 @@ def read_cookies():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(script_dir, "..", "cookies.json")
     with open(config_path, "r") as f:
-        return json.load(f)
+        data = json.load(f)
+    if isinstance(data, list):
+        extracted = {}
+        for item in data:
+            if isinstance(item, dict) and "name" in item and "value" in item:
+                extracted[item["name"]] = item["value"]
+        data = extracted
+
+    # Filter out volatile/ephemeral WAF tokens that trigger TikTok 429
+    bad_keys = {
+        "_waftokenid",
+        "waforigin_id",
+        "waforiginalreid",
+        "s_v_web_id",
+        "perf_feed_cache",
+        "delay_guest_mode_vid",
+        "living_user_id",
+        "passport_fe_beating_status",
+    }
+    return {k: v for k, v in data.items() if k not in bad_keys and v}
+
+
 
 
 def read_telegram_config():

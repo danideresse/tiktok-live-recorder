@@ -15,30 +15,45 @@ class Telegram:
     def __init__(self):
         config = read_telegram_config()
 
-        self.api_id = config["api_id"]
-        self.api_hash = config["api_hash"]
-        self.chat_id = config["chat_id"]
+        self.api_id = config.get("api_id")
+        self.api_hash = config.get("api_hash")
+        self.chat_id = config.get("chat_id", "me")
+        self.bot_token = config.get("bot_token") or None
 
+        session_name = (
+            "tiktok_live_recorder_bot"
+            if self.bot_token
+            else "tiktok_live_recorder_session"
+        )
         self.client = TelegramClient(
-            "tiktok_live_recorder_session",
+            session_name,
             api_id=self.api_id,
             api_hash=self.api_hash,
         )
 
-    def upload(self, file_path: str):
+    def upload(self, file_path: str, chat_id=None):
         """
-        Upload a file to the user's Saved Messages via Telethon.
+        Upload a file to the user's Saved Messages or specified chat via Telethon.
         """
+        target_chat = chat_id or self.chat_id
+        if isinstance(target_chat, str) and (
+            target_chat.isdigit()
+            or (target_chat.startswith("-") and target_chat[1:].isdigit())
+        ):
+            target_chat = int(target_chat)
 
         async def _upload():
             try:
                 await self.client.connect()
 
                 if not await self.client.is_user_authorized():
-                    await self.client.start()
+                    if self.bot_token:
+                        await self.client.start(bot_token=self.bot_token)
+                    else:
+                        await self.client.start()
 
                 me = await self.client.get_me()
-                is_premium = me.premium
+                is_premium = getattr(me, "premium", False)
                 max_size = (
                     PREMIUM_USER_MAX_FILE_SIZE
                     if is_premium
@@ -64,7 +79,7 @@ class Telegram:
                 )
 
                 await self.client.send_file(
-                    entity=self.chat_id,
+                    entity=target_chat,
                     file=file_path,
                     caption=(
                         "🎥 <b>Video recorded via "

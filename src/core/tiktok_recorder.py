@@ -27,6 +27,8 @@ class TikTokRecorder:
         self.bitrate = config.bitrate
         self.ffmpeg_path = config.ffmpeg_path
         self.use_telegram = config.use_telegram
+        self.stop_event = config.stop_event
+        self.on_finish = config.on_finish
         self._proxy = config.proxy
         self._cookies = config.cookies
 
@@ -100,6 +102,8 @@ class TikTokRecorder:
 
     def automatic_mode(self):
         while True:
+            if self.stop_event and self.stop_event.is_set():
+                break
             try:
                 self.room_id = self.tiktok.get_room_id_from_user(self.user)
                 self.manual_mode()
@@ -109,11 +113,19 @@ class TikTokRecorder:
                 logger.info(
                     f"Waiting {self.automatic_interval} minutes before recheck\n"
                 )
-                time.sleep(self.automatic_interval * TimeOut.ONE_MINUTE)
+                interval_secs = self.automatic_interval * TimeOut.ONE_MINUTE
+                for _ in range(interval_secs):
+                    if self.stop_event and self.stop_event.is_set():
+                        return
+                    time.sleep(1)
 
             except (ConnectionError, RequestException, HTTPException):
                 logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
-                time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
+                interval_secs = TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE
+                for _ in range(interval_secs):
+                    if self.stop_event and self.stop_event.is_set():
+                        return
+                    time.sleep(1)
 
     def followers_mode(self):
         active_recordings = {}  # follower -> Thread
@@ -180,9 +192,10 @@ class TikTokRecorder:
         filename = (
             f"TK_{user}_{time.strftime('%Y.%m.%d_%H-%M-%S', time.localtime())}_flv.mp4"
         )
-        if self.output:
-            return str(Path(self.output) / filename)
-        return filename
+        out_dir = Path(self.output) if self.output else Path("recordings")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return str(out_dir / filename)
+
 
     def start_recording(self, user, room_id):
         """
@@ -213,6 +226,11 @@ class TikTokRecorder:
                 stop_recording = False
                 stream_ended = False
                 while not stop_recording:
+                    if self.stop_event and self.stop_event.is_set():
+                        logger.info("Recording stopped by stop_event.")
+                        stop_recording = True
+                        break
+
                     try:
                         if not self.tiktok.is_room_alive(room_id):
                             logger.info("User is no longer live. Stopping recording.")
@@ -220,6 +238,10 @@ class TikTokRecorder:
 
                         start_time = time.time()
                         for chunk in self.tiktok.download_live_stream(live_url):
+                            if self.stop_event and self.stop_event.is_set():
+                                stop_recording = True
+                                break
+
                             buffer.extend(chunk)
                             bytes_written += len(chunk)
                             if len(buffer) >= buffer_size:
@@ -275,6 +297,22 @@ class TikTokRecorder:
 
         logger.info(f"Recording finished: {Path(output).resolve()}\n")
         VideoManagement.convert_flv_to_mp4(output, self.bitrate, self.ffmpeg_path)
+        mp4_file = output.replace("_flv.mp4", ".mp4")
+
+        if self.on_finish:
+            try:
+                self.on_finish(mp4_file)
+            except Exception as e:
+                logger.error(f"Error in on_finish callback: {e}")
+
+        if self.use_telegram:
+            try:
+                from upload.telegram import Telegram
+                Telegram().upload(mp4_file)
+            except Exception as e:
+                logger.error(f"Telegram upload failed: {e}")
+
+
 
     def check_country_blacklisted(self):
         is_blacklisted = self.tiktok.is_country_blacklisted()
